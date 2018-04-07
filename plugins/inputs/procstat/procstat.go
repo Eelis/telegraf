@@ -231,14 +231,14 @@ func (p *Procstat) addMetrics(proc Process, acc telegraf.Accumulator) {
 
 // Update monitored Processes
 func (p *Procstat) updateProcesses(prevInfo map[PID]Process) (map[PID]Process, error) {
-	pids, tags, err := p.findPids()
+	tagsPerPid, err := p.findPids()
 	if err != nil {
 		return nil, err
 	}
 
 	procs := make(map[PID]Process, len(prevInfo))
 
-	for _, pid := range pids {
+	for pid, tags := range tagsPerPid {
 		info, ok := prevInfo[pid]
 		if ok {
 			procs[pid] = info
@@ -281,14 +281,15 @@ func (p *Procstat) getPIDFinder() (PIDFinder, error) {
 }
 
 // Get matching PIDs and their initial tags
-func (p *Procstat) findPids() ([]PID, map[string]string, error) {
-	var pids []PID
+func (p *Procstat) findPids() (map[PID]map[string]string, error) {
+	pids := []PID{}
+	tagsPerPid := make(map[PID]map[string]string)
 	var tags map[string]string
 	var err error
 
 	f, err := p.getPIDFinder()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	if p.PidFile != "" {
@@ -304,7 +305,7 @@ func (p *Procstat) findPids() ([]PID, map[string]string, error) {
 		pids, err = f.Uid(p.User)
 		tags = map[string]string{"user": p.User}
 	} else if p.SystemdUnit != "" {
-		pids, err = p.systemdUnitPIDs()
+		tagsPerPid, err = p.systemdUnitPIDs()
 		tags = map[string]string{"systemd_unit": p.SystemdUnit}
 	} else if p.CGroup != "" {
 		pids, err = p.cgroupPIDs()
@@ -313,37 +314,61 @@ func (p *Procstat) findPids() ([]PID, map[string]string, error) {
 		err = fmt.Errorf("Either exe, pid_file, user, pattern, systemd_unit, or cgroup must be specified")
 	}
 
-	return pids, tags, err
+	if err == nil {
+		// merge pids into tagsPerPid:
+		for _, pid := range pids {
+			_, ok := tagsPerPid[pid]
+			if !ok { tagsPerPid[pid] = make(map[string]string) }
+		}
+
+		// assign tags common to all pids:
+		for pid, tagsForPid := range tagsPerPid {
+			for k, v := range tags { tagsForPid[k] = v }
+			tagsPerPid[pid] = tagsForPid
+		}
+	}
+
+	return tagsPerPid, err
 }
 
 // execCommand is so tests can mock out exec.Command usage.
 var execCommand = exec.Command
 
-func (p *Procstat) systemdUnitPIDs() ([]PID, error) {
-	var pids []PID
+func (p *Procstat) systemdUnitPIDs() (map[PID]map[string]string, error) {
+	tagsPerPid := make(map[PID]map[string]string)
 	cmd := execCommand("systemctl", "show", p.SystemdUnit)
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, err
 	}
-	for _, line := range bytes.Split(out, []byte{'\n'}) {
-		kv := bytes.SplitN(line, []byte{'='}, 2)
-		if len(kv) != 2 {
-			continue
+
+	for _, unit := range bytes.Split(out, []byte("\n\n")) {
+		unitId := ""
+		pidStr := ""
+
+		for _, line := range bytes.Split(unit, []byte{'\n'}) {
+			kv := bytes.SplitN(line, []byte{'='}, 2)
+			if len(kv) != 2 {
+				continue
+			}
+			if bytes.Equal(kv[0], []byte("Id")) {
+				unitId = string(kv[1])
+			} else if bytes.Equal(kv[0], []byte("MainPID")) {
+				pidStr = string(kv[1])
+			}
 		}
-		if !bytes.Equal(kv[0], []byte("MainPID")) {
-			continue
+
+		if pidStr != "" {
+			pid, err := strconv.Atoi(string(pidStr))
+			if err != nil {
+				return nil, fmt.Errorf("invalid pid '%s'", pidStr)
+			}
+
+			tagsPerPid[PID(pid)] = map[string]string{"systemd_unit_id": unitId}
 		}
-		if len(kv[1]) == 0 {
-			return nil, nil
-		}
-		pid, err := strconv.Atoi(string(kv[1]))
-		if err != nil {
-			return nil, fmt.Errorf("invalid pid '%s'", kv[1])
-		}
-		pids = append(pids, PID(pid))
 	}
-	return pids, nil
+
+	return tagsPerPid, nil
 }
 
 func (p *Procstat) cgroupPIDs() ([]PID, error) {
